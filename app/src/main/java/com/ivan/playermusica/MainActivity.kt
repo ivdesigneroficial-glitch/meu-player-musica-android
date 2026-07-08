@@ -2,17 +2,21 @@ package com.ivan.playermusica
 
 import android.Manifest
 import android.app.AlertDialog
+import android.content.ComponentName
 import android.content.ContentUris
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.database.ContentObserver
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.AudioManager
-import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import android.os.IBinder
 import android.os.Looper
 import android.provider.MediaStore
 import android.text.Editable
@@ -27,7 +31,6 @@ import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.google.android.material.tabs.TabLayout
 import com.ivan.playermusica.databinding.ActivityMainBinding
-import kotlin.random.Random
 
 class MainActivity : AppCompatActivity() {
 
@@ -39,22 +42,25 @@ class MainActivity : AppCompatActivity() {
 
     private var tab = 0
     private var drillKey: String? = null
-
-    private var queue: List<Song> = emptyList()
-    private var queueIndex = -1
     private var queueOnPlayList: List<Song> = emptyList()
-
-    private val player = MediaPlayer()
-    private var prepared = false
-
-    private var shuffle = false
-    private var repeatMode = 0 // 0 off, 1 all, 2 one
-    private val history = ArrayDeque<Int>()
 
     private val handler = Handler(Looper.getMainLooper())
     private var observer: ContentObserver? = null
-
     private val artBase: Uri = Uri.parse("content://media/external/audio/albumart")
+
+    private var music: MusicService? = null
+    private var bound = false
+    private var isSeeking = false
+
+    private val conn = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, ib: IBinder?) {
+            music = (ib as MusicService.LocalBinder).getService()
+            bound = true
+            music!!.onChanged = { runOnUiThread { syncUi() } }
+            syncUi(); startPoller()
+        }
+        override fun onServiceDisconnected(name: ComponentName?) { bound = false; music = null }
+    }
 
     private val permLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -66,6 +72,10 @@ class MainActivity : AppCompatActivity() {
             binding.emptyState.visibility = android.view.View.VISIBLE
         }
     }
+
+    private val notifPermLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* result ignored; playback works either way */ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -79,7 +89,6 @@ class MainActivity : AppCompatActivity() {
         binding.songList.layoutManager = LinearLayoutManager(this)
         binding.songList.adapter = adapter
 
-        setupPlayer()
         setupControls()
         setupSearch()
         setupTabs()
@@ -95,7 +104,23 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
         requestPermissionAndLoad()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        bindService(Intent(this, MusicService::class.java), conn, Context.BIND_AUTO_CREATE)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        handler.removeCallbacks(poller)
+        if (bound) { music?.onChanged = null; unbindService(conn); bound = false }
     }
 
     // ---------------- Permission + loading ----------------
@@ -198,7 +223,7 @@ class MainActivity : AppCompatActivity() {
     private fun refresh() {
         val q = query()
         val rows = mutableListOf<Row>()
-        val playingId = if (queueIndex in queue.indices) queue[queueIndex].id else -1L
+        val playingId = music?.currentSong()?.id ?: -1L
 
         val showingSongs: Boolean
         when {
@@ -377,105 +402,112 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    // ---------------- Player ----------------
-    private fun setupPlayer() {
-        player.setOnCompletionListener { nextTrack(auto = true) }
-        player.setOnPreparedListener {
-            prepared = true
-            it.start()
-            binding.npSeek.max = it.duration
-            binding.miniProgress.max = it.duration
-            binding.npDur.text = formatTime(it.duration.toLong())
-            updatePlayIcon()
-            startSeekUpdater()
-        }
-    }
-
+    // ---------------- Controls (delegate to service) ----------------
     private fun setupControls() {
         val toggle = {
-            if (queueIndex == -1 && queueOnPlayList.isNotEmpty()) { playAt(queueOnPlayList, 0); openNowPlaying() }
-            else { if (player.isPlaying) player.pause() else if (prepared) player.start(); updatePlayIcon() }
+            val s = music
+            if (s?.currentSong() == null && queueOnPlayList.isNotEmpty()) { playAt(queueOnPlayList, 0); openNowPlaying() }
+            else s?.togglePlayPause()
         }
         binding.npPlaypause.setOnClickListener { toggle() }
         binding.miniPlaypause.setOnClickListener { toggle() }
 
-        binding.npNext.setOnClickListener { nextTrack(auto = false) }
-        binding.npPrev.setOnClickListener { prevTrack() }
+        binding.npNext.setOnClickListener { music?.next(false) }
+        binding.npPrev.setOnClickListener { music?.prev() }
 
         binding.npShuffle.setOnClickListener {
-            shuffle = !shuffle; history.clear(); updateShuffleIcon()
-            toast(if (shuffle) "Aleatório ligado" else "Aleatório desligado")
+            val s = music ?: return@setOnClickListener
+            s.shuffle = !s.shuffle; updateShuffleIcon(s.shuffle)
+            toast(if (s.shuffle) "Aleatório ligado" else "Aleatório desligado")
         }
         binding.npRepeat.setOnClickListener {
-            repeatMode = (repeatMode + 1) % 3; updateRepeatIcon()
-            toast(when (repeatMode) { 1 -> "Repetir todas"; 2 -> "Repetir esta música"; else -> "Repetir desligado" })
+            val s = music ?: return@setOnClickListener
+            s.repeatMode = (s.repeatMode + 1) % 3; updateRepeatIcon(s.repeatMode)
+            toast(when (s.repeatMode) { 1 -> "Repetir todas"; 2 -> "Repetir esta música"; else -> "Repetir desligado" })
         }
 
         binding.miniBar.setOnClickListener { openNowPlaying() }
         binding.btnNpClose.setOnClickListener { closeNowPlaying() }
         binding.btnNpAdd.setOnClickListener {
-            if (queueIndex in queue.indices) choosePlaylistToAdd(queue[queueIndex].id)
+            music?.currentSong()?.let { choosePlaylistToAdd(it.id) }
         }
 
         binding.npSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
                 if (fromUser) binding.npCur.text = formatTime(p.toLong())
             }
-            override fun onStartTrackingTouch(sb: SeekBar?) {}
-            override fun onStopTrackingTouch(sb: SeekBar?) { if (prepared) player.seekTo(sb?.progress ?: 0) }
-        })
-
-        updateShuffleIcon(); updateRepeatIcon()
-    }
-
-    private fun updateShuffleIcon() {
-        binding.npShuffle.setColorFilter(if (shuffle) 0xFFF6C915.toInt() else 0xFF9797A8.toInt())
-    }
-
-    private fun updateRepeatIcon() {
-        binding.npRepeat.setImageResource(if (repeatMode == 2) R.drawable.ic_repeat_one else R.drawable.ic_repeat)
-        binding.npRepeat.setColorFilter(if (repeatMode != 0) 0xFFF6C915.toInt() else 0xFF9797A8.toInt())
-    }
-
-    private fun setupSearch() {
-        binding.searchInput.addTextChangedListener(object : TextWatcher {
-            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) { refresh() }
-            override fun afterTextChanged(s: Editable?) {}
+            override fun onStartTrackingTouch(sb: SeekBar?) { isSeeking = true }
+            override fun onStopTrackingTouch(sb: SeekBar?) { music?.seekTo(sb?.progress ?: 0); isSeeking = false }
         })
     }
 
     private fun playAt(list: List<Song>, index: Int) {
+        val s = music ?: return
         if (index < 0 || index >= list.size) return
-        queue = list.toList(); queueIndex = index; history.clear()
-        loadAndPlay(queue[queueIndex])
+        ContextCompat.startForegroundService(this, Intent(this, MusicService::class.java))
+        s.setQueue(list, index)
     }
 
-    private fun loadAndPlay(song: Song) {
-        try {
-            prepared = false
-            player.reset()
-            player.setDataSource(this, song.uri)
-            player.prepareAsync()
-            binding.miniBar.visibility = android.view.View.VISIBLE
-            updateNowPlayingUI(song)
-            adapter.setPlaying(song.id)
-        } catch (e: Exception) { e.printStackTrace() }
+    private fun updateShuffleIcon(on: Boolean) {
+        binding.npShuffle.setColorFilter(if (on) 0xFFF6C915.toInt() else 0xFF9797A8.toInt())
     }
 
-    private fun updateNowPlayingUI(song: Song) {
+    private fun updateRepeatIcon(mode: Int) {
+        binding.npRepeat.setImageResource(if (mode == 2) R.drawable.ic_repeat_one else R.drawable.ic_repeat)
+        binding.npRepeat.setColorFilter(if (mode != 0) 0xFFF6C915.toInt() else 0xFF9797A8.toInt())
+    }
+
+    private fun updatePlayIcon(playing: Boolean) {
+        val res = if (playing) R.drawable.ic_pause else R.drawable.ic_play_arrow
+        binding.npPlaypause.setImageResource(res)
+        binding.miniPlaypause.setImageResource(res)
+    }
+
+    private fun syncUi() {
+        val s = music
+        val song = s?.currentSong()
+        if (song == null) { binding.miniBar.visibility = android.view.View.GONE; return }
+        binding.miniBar.visibility = android.view.View.VISIBLE
+
         val artistTxt = if (song.artist.isBlank() || song.artist == "<unknown>") "Artista desconhecido" else song.artist
         binding.miniTitle.text = song.title
         binding.miniArtist.text = artistTxt
         binding.npBigTitle.text = song.title
         binding.npBigArtist.text = artistTxt
+
         val bmp = loadArtBitmap(song)
-        if (bmp != null) {
-            binding.miniArt.setImageBitmap(bmp); binding.npBigArt.setImageBitmap(bmp)
-        } else {
-            binding.miniArt.setImageResource(R.drawable.ic_note); binding.npBigArt.setImageResource(R.drawable.ic_note)
+        if (bmp != null) { binding.miniArt.setImageBitmap(bmp); binding.npBigArt.setImageBitmap(bmp) }
+        else { binding.miniArt.setImageResource(R.drawable.ic_note); binding.npBigArt.setImageResource(R.drawable.ic_note) }
+
+        updatePlayIcon(s.isPlaying())
+        updateShuffleIcon(s.shuffle)
+        updateRepeatIcon(s.repeatMode)
+        adapter.setPlaying(song.id)
+
+        val dur = s.duration()
+        if (dur > 0) { binding.npSeek.max = dur; binding.miniProgress.max = dur; binding.npDur.text = formatTime(dur.toLong()) }
+    }
+
+    private val poller = object : Runnable {
+        override fun run() {
+            val s = music
+            if (s != null && s.prepared) {
+                val dur = s.duration()
+                if (dur > 0) {
+                    if (binding.npSeek.max != dur) { binding.npSeek.max = dur; binding.miniProgress.max = dur }
+                    binding.npDur.text = formatTime(dur.toLong())
+                }
+                if (!isSeeking) {
+                    val pos = s.position()
+                    binding.npSeek.progress = pos
+                    binding.miniProgress.progress = pos
+                    binding.npCur.text = formatTime(pos.toLong())
+                }
+            }
+            handler.postDelayed(this, 500)
         }
     }
+    private fun startPoller() { handler.removeCallbacks(poller); handler.post(poller) }
 
     private fun loadArtBitmap(song: Song): Bitmap? {
         val uri = ContentUris.withAppendedId(artBase, song.albumId)
@@ -486,54 +518,6 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) { null }
     }
 
-    private fun nextTrack(auto: Boolean) {
-        if (queue.isEmpty()) return
-        if (repeatMode == 2 && auto) { player.seekTo(0); player.start(); return }
-        when {
-            shuffle && queue.size > 1 -> {
-                history.addLast(queueIndex)
-                var r: Int
-                do { r = Random.nextInt(queue.size) } while (r == queueIndex)
-                queueIndex = r
-            }
-            queueIndex < queue.size - 1 -> queueIndex++
-            repeatMode == 1 -> queueIndex = 0
-            else -> { player.pause(); updatePlayIcon(); return }
-        }
-        loadAndPlay(queue[queueIndex])
-    }
-
-    private fun prevTrack() {
-        if (queue.isEmpty()) return
-        if (prepared && player.currentPosition > 3000) { player.seekTo(0); return }
-        when {
-            shuffle && history.isNotEmpty() -> queueIndex = history.removeLast()
-            queueIndex > 0 -> queueIndex--
-            repeatMode == 1 -> queueIndex = queue.size - 1
-            else -> { player.seekTo(0); return }
-        }
-        loadAndPlay(queue[queueIndex])
-    }
-
-    private fun updatePlayIcon() {
-        val res = if (player.isPlaying) R.drawable.ic_pause else R.drawable.ic_play_arrow
-        binding.npPlaypause.setImageResource(res)
-        binding.miniPlaypause.setImageResource(res)
-    }
-
-    private val seekRunnable = object : Runnable {
-        override fun run() {
-            if (prepared && player.isPlaying) {
-                val pos = player.currentPosition
-                binding.npSeek.progress = pos
-                binding.miniProgress.progress = pos
-                binding.npCur.text = formatTime(pos.toLong())
-            }
-            handler.postDelayed(this, 500)
-        }
-    }
-    private fun startSeekUpdater() { handler.removeCallbacks(seekRunnable); handler.post(seekRunnable) }
-
     private fun formatTime(ms: Long): String { val t = ms / 1000; return "%d:%02d".format(t / 60, t % 60) }
 
     private fun toast(msg: String) =
@@ -542,12 +526,12 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         if (ContextCompat.checkSelfPermission(this, permissionName()) == PackageManager.PERMISSION_GRANTED) loadSongs()
+        if (bound) syncUi()
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        handler.removeCallbacks(seekRunnable)
+        handler.removeCallbacks(poller)
         observer?.let { contentResolver.unregisterContentObserver(it) }
-        player.release()
     }
 }
