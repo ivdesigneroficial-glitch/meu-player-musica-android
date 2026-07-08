@@ -5,8 +5,11 @@ import android.app.AlertDialog
 import android.content.ContentUris
 import android.content.pm.PackageManager
 import android.database.ContentObserver
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.AudioManager
 import android.media.MediaPlayer
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -34,13 +37,12 @@ class MainActivity : AppCompatActivity() {
 
     private var allSongs: List<Song> = emptyList()
 
-    // Navigation state
-    private var tab = 0            // 0 Musicas, 1 Albuns, 2 Artistas, 3 Pastas, 4 Playlists
+    private var tab = 0
     private var drillKey: String? = null
 
-    // Playback queue
     private var queue: List<Song> = emptyList()
     private var queueIndex = -1
+    private var queueOnPlayList: List<Song> = emptyList()
 
     private val player = MediaPlayer()
     private var prepared = false
@@ -52,12 +54,13 @@ class MainActivity : AppCompatActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private var observer: ContentObserver? = null
 
+    private val artBase: Uri = Uri.parse("content://media/external/audio/albumart")
+
     private val permLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
-        if (granted) {
-            loadSongs(); registerObserver()
-        } else {
+        if (granted) { loadSongs(); registerObserver() }
+        else {
             binding.emptyState.text =
                 "Preciso da permissão de acesso às músicas.\n\nAbra as configurações do app e permita o acesso a Música/Áudio."
             binding.emptyState.visibility = android.view.View.VISIBLE
@@ -84,7 +87,11 @@ class MainActivity : AppCompatActivity() {
         binding.btnBack.setOnClickListener { goUp() }
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (drillKey != null) goUp() else { isEnabled = false; onBackPressedDispatcher.onBackPressed() }
+                when {
+                    binding.nowPlaying.visibility == android.view.View.VISIBLE -> closeNowPlaying()
+                    drillKey != null -> goUp()
+                    else -> { isEnabled = false; onBackPressedDispatcher.onBackPressed() }
+                }
             }
         })
 
@@ -174,19 +181,14 @@ class MainActivity : AppCompatActivity() {
     private fun setupTabs() {
         binding.tabs.addOnTabSelectedListener(object : TabLayout.OnTabSelectedListener {
             override fun onTabSelected(t: TabLayout.Tab) {
-                tab = t.position
-                drillKey = null
-                binding.searchInput.setText("")
-                refresh()
+                tab = t.position; drillKey = null; binding.searchInput.setText(""); refresh()
             }
             override fun onTabUnselected(t: TabLayout.Tab) {}
             override fun onTabReselected(t: TabLayout.Tab) { drillKey = null; refresh() }
         })
     }
 
-    private fun goUp() {
-        if (drillKey != null) { drillKey = null; refresh() }
-    }
+    private fun goUp() { if (drillKey != null) { drillKey = null; refresh() } }
 
     private fun query(): String = binding.searchInput.text?.toString()?.trim()?.lowercase() ?: ""
 
@@ -206,10 +208,7 @@ class MainActivity : AppCompatActivity() {
                 queueOnPlayList = songs
                 rows += songs.map { Row.SongRow(it) }
             }
-            drillKey == null -> {
-                showingSongs = false
-                rows += buildGroups(q)
-            }
+            drillKey == null -> { showingSongs = false; rows += buildGroups(q) }
             else -> {
                 showingSongs = true
                 val songs = songsForDrill()
@@ -233,44 +232,33 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Header + back button
         binding.btnBack.visibility = if (drillKey != null) android.view.View.VISIBLE else android.view.View.GONE
         binding.headerTitle.text = drillKey?.removePrefix("pl:") ?: "Meu Player"
-        binding.countLabel.text =
-            if (showingSongs) "${rows.size}" else ""
+        binding.countLabel.text = if (showingSongs) "${rows.size}" else ""
     }
-
-    // temp holder so playAt can reference the exact list shown
-    private var queueOnPlayList: List<Song> = emptyList()
 
     private fun buildGroups(q: String): List<Row> {
         val rows = mutableListOf<Row>()
         when (tab) {
-            1 -> { // Albums
-                allSongs.groupBy { if (it.album.isBlank()) "Álbum desconhecido" else it.album }
-                    .toSortedMap(String.CASE_INSENSITIVE_ORDER)
-                    .forEach { (name, list) ->
-                        if (q.isEmpty() || name.lowercase().contains(q))
-                            rows += Row.GroupRow(name, name, "${list.size} músicas", R.drawable.ic_album)
-                    }
-            }
-            2 -> { // Artists
-                allSongs.groupBy { if (it.artist.isBlank() || it.artist == "<unknown>") "Artista desconhecido" else it.artist }
-                    .toSortedMap(String.CASE_INSENSITIVE_ORDER)
-                    .forEach { (name, list) ->
-                        if (q.isEmpty() || name.lowercase().contains(q))
-                            rows += Row.GroupRow(name, name, "${list.size} músicas", R.drawable.ic_artist)
-                    }
-            }
-            3 -> { // Folders
-                allSongs.groupBy { it.folder }
-                    .toSortedMap(String.CASE_INSENSITIVE_ORDER)
-                    .forEach { (name, list) ->
-                        if (q.isEmpty() || name.lowercase().contains(q))
-                            rows += Row.GroupRow(name, name, "${list.size} músicas", R.drawable.ic_folder)
-                    }
-            }
-            4 -> { // Playlists
+            1 -> allSongs.groupBy { if (it.album.isBlank()) "Álbum desconhecido" else it.album }
+                .toSortedMap(String.CASE_INSENSITIVE_ORDER)
+                .forEach { (name, list) ->
+                    if (q.isEmpty() || name.lowercase().contains(q))
+                        rows += Row.GroupRow(name, name, "${list.size} músicas", R.drawable.ic_album)
+                }
+            2 -> allSongs.groupBy { if (it.artist.isBlank() || it.artist == "<unknown>") "Artista desconhecido" else it.artist }
+                .toSortedMap(String.CASE_INSENSITIVE_ORDER)
+                .forEach { (name, list) ->
+                    if (q.isEmpty() || name.lowercase().contains(q))
+                        rows += Row.GroupRow(name, name, "${list.size} músicas", R.drawable.ic_artist)
+                }
+            3 -> allSongs.groupBy { it.folder }
+                .toSortedMap(String.CASE_INSENSITIVE_ORDER)
+                .forEach { (name, list) ->
+                    if (q.isEmpty() || name.lowercase().contains(q))
+                        rows += Row.GroupRow(name, name, "${list.size} músicas", R.drawable.ic_folder)
+                }
+            4 -> {
                 rows += Row.GroupRow("__new__", "Nova playlist", "Criar uma playlist", R.drawable.ic_add)
                 playlists.getAll().forEach { p ->
                     if (q.isEmpty() || p.name.lowercase().contains(q))
@@ -301,14 +289,11 @@ class MainActivity : AppCompatActivity() {
         when (row) {
             is Row.GroupRow -> {
                 if (row.key == "__new__") { showCreatePlaylistDialog(); return }
-                drillKey = row.key
-                binding.searchInput.setText("")
-                refresh()
+                drillKey = row.key; binding.searchInput.setText(""); refresh()
             }
             is Row.SongRow -> {
-                val list = queueOnPlayList
-                val idx = list.indexOfFirst { it.id == row.song.id }
-                if (idx >= 0) playAt(list, idx)
+                val idx = queueOnPlayList.indexOfFirst { it.id == row.song.id }
+                if (idx >= 0) { playAt(queueOnPlayList, idx); openNowPlaying() }
             }
         }
     }
@@ -319,25 +304,19 @@ class MainActivity : AppCompatActivity() {
                 val inPlaylist = tab == 4 && drillKey != null
                 if (inPlaylist) {
                     val plName = drillKey!!.removePrefix("pl:")
-                    AlertDialog.Builder(this)
-                        .setTitle(row.song.title)
+                    AlertDialog.Builder(this).setTitle(row.song.title)
                         .setItems(arrayOf("Adicionar a outra playlist", "Remover desta playlist")) { _, w ->
                             if (w == 0) choosePlaylistToAdd(row.song.id)
                             else { playlists.removeSong(plName, row.song.id); refresh() }
                         }.show()
-                } else {
-                    choosePlaylistToAdd(row.song.id)
-                }
+                } else choosePlaylistToAdd(row.song.id)
             }
             is Row.GroupRow -> {
                 if (row.key.startsWith("pl:")) {
                     val name = row.key.removePrefix("pl:")
-                    AlertDialog.Builder(this)
-                        .setTitle(name)
+                    AlertDialog.Builder(this).setTitle(name)
                         .setItems(arrayOf("Renomear", "Excluir")) { _, w ->
-                            if (w == 0) showRenamePlaylistDialog(name) else {
-                                playlists.delete(name); refresh()
-                            }
+                            if (w == 0) showRenamePlaylistDialog(name) else { playlists.delete(name); refresh() }
                         }.show()
                 }
             }
@@ -349,57 +328,53 @@ class MainActivity : AppCompatActivity() {
         if (all.isEmpty()) { showCreatePlaylistDialog(songId); return }
         val names = all.map { it.name }.toMutableList()
         names.add("＋ Nova playlist")
-        AlertDialog.Builder(this)
-            .setTitle("Adicionar à playlist")
+        AlertDialog.Builder(this).setTitle("Adicionar à playlist")
             .setItems(names.toTypedArray()) { _, w ->
                 if (w == names.size - 1) showCreatePlaylistDialog(songId)
-                else {
-                    playlists.addSong(names[w], songId)
-                    toast("Adicionada a \"${names[w]}\"")
-                    refresh()
-                }
+                else { playlists.addSong(names[w], songId); toast("Adicionada a \"${names[w]}\""); refresh() }
             }.show()
     }
 
     private fun showCreatePlaylistDialog(songToAdd: Long? = null) {
-        val input = EditText(this)
-        input.inputType = InputType.TYPE_CLASS_TEXT
-        input.hint = "Nome da playlist"
-        input.setPadding(48, 32, 48, 32)
-        AlertDialog.Builder(this)
-            .setTitle("Nova playlist")
-            .setView(input)
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT; hint = "Nome da playlist"; setPadding(48, 32, 48, 32)
+        }
+        AlertDialog.Builder(this).setTitle("Nova playlist").setView(input)
             .setPositiveButton("Criar") { _, _ ->
                 val name = input.text.toString().trim()
                 if (name.isEmpty()) return@setPositiveButton
                 if (playlists.create(name)) {
                     if (songToAdd != null) playlists.addSong(name, songToAdd)
-                    toast("Playlist \"$name\" criada")
-                    refresh()
+                    toast("Playlist \"$name\" criada"); refresh()
                 } else toast("Já existe uma playlist com esse nome")
-            }
-            .setNegativeButton("Cancelar", null)
-            .show()
+            }.setNegativeButton("Cancelar", null).show()
     }
 
     private fun showRenamePlaylistDialog(oldName: String) {
-        val input = EditText(this)
-        input.setText(oldName)
-        input.inputType = InputType.TYPE_CLASS_TEXT
-        input.setPadding(48, 32, 48, 32)
-        AlertDialog.Builder(this)
-            .setTitle("Renomear playlist")
-            .setView(input)
+        val input = EditText(this).apply {
+            setText(oldName); inputType = InputType.TYPE_CLASS_TEXT; setPadding(48, 32, 48, 32)
+        }
+        AlertDialog.Builder(this).setTitle("Renomear playlist").setView(input)
             .setPositiveButton("Salvar") { _, _ ->
                 val name = input.text.toString().trim()
                 if (name.isEmpty()) return@setPositiveButton
                 if (playlists.rename(oldName, name)) {
-                    if (drillKey == "pl:$oldName") drillKey = "pl:$name"
-                    refresh()
+                    if (drillKey == "pl:$oldName") drillKey = "pl:$name"; refresh()
                 } else toast("Nome já usado")
-            }
-            .setNegativeButton("Cancelar", null)
-            .show()
+            }.setNegativeButton("Cancelar", null).show()
+    }
+
+    // ---------------- Now Playing screen ----------------
+    private fun openNowPlaying() {
+        binding.nowPlaying.visibility = android.view.View.VISIBLE
+        binding.nowPlaying.alpha = 0f
+        binding.nowPlaying.animate().alpha(1f).setDuration(180).start()
+    }
+
+    private fun closeNowPlaying() {
+        binding.nowPlaying.animate().alpha(0f).setDuration(150).withEndAction {
+            binding.nowPlaying.visibility = android.view.View.GONE
+        }.start()
     }
 
     // ---------------- Player ----------------
@@ -408,37 +383,58 @@ class MainActivity : AppCompatActivity() {
         player.setOnPreparedListener {
             prepared = true
             it.start()
-            binding.seek.max = it.duration
-            binding.durTime.text = formatTime(it.duration.toLong())
+            binding.npSeek.max = it.duration
+            binding.miniProgress.max = it.duration
+            binding.npDur.text = formatTime(it.duration.toLong())
             updatePlayIcon()
             startSeekUpdater()
         }
     }
 
     private fun setupControls() {
-        binding.btnPlaypause.setOnClickListener {
-            if (queueIndex == -1 && queueOnPlayList.isNotEmpty()) { playAt(queueOnPlayList, 0); return@setOnClickListener }
-            if (player.isPlaying) player.pause() else if (prepared) player.start()
-            updatePlayIcon()
+        val toggle = {
+            if (queueIndex == -1 && queueOnPlayList.isNotEmpty()) { playAt(queueOnPlayList, 0); openNowPlaying() }
+            else { if (player.isPlaying) player.pause() else if (prepared) player.start(); updatePlayIcon() }
         }
-        binding.btnNext.setOnClickListener { nextTrack(auto = false) }
-        binding.btnPrev.setOnClickListener { prevTrack() }
-        binding.btnShuffle.setOnClickListener {
-            shuffle = !shuffle; history.clear()
-            binding.btnShuffle.setColorFilter(if (shuffle) 0xFFF6C915.toInt() else 0xFF9797A8.toInt())
+        binding.npPlaypause.setOnClickListener { toggle() }
+        binding.miniPlaypause.setOnClickListener { toggle() }
+
+        binding.npNext.setOnClickListener { nextTrack(auto = false) }
+        binding.npPrev.setOnClickListener { prevTrack() }
+
+        binding.npShuffle.setOnClickListener {
+            shuffle = !shuffle; history.clear(); updateShuffleIcon()
+            toast(if (shuffle) "Aleatório ligado" else "Aleatório desligado")
         }
-        binding.btnRepeat.setOnClickListener {
-            repeatMode = (repeatMode + 1) % 3
-            binding.btnRepeat.setColorFilter(if (repeatMode != 0) 0xFFF6C915.toInt() else 0xFF9797A8.toInt())
-            toast(when (repeatMode) { 1 -> "Repetir tudo"; 2 -> "Repetir esta música"; else -> "Repetir desligado" })
+        binding.npRepeat.setOnClickListener {
+            repeatMode = (repeatMode + 1) % 3; updateRepeatIcon()
+            toast(when (repeatMode) { 1 -> "Repetir todas"; 2 -> "Repetir esta música"; else -> "Repetir desligado" })
         }
-        binding.seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+
+        binding.miniBar.setOnClickListener { openNowPlaying() }
+        binding.btnNpClose.setOnClickListener { closeNowPlaying() }
+        binding.btnNpAdd.setOnClickListener {
+            if (queueIndex in queue.indices) choosePlaylistToAdd(queue[queueIndex].id)
+        }
+
+        binding.npSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                if (fromUser) binding.curTime.text = formatTime(p.toLong())
+                if (fromUser) binding.npCur.text = formatTime(p.toLong())
             }
             override fun onStartTrackingTouch(sb: SeekBar?) {}
             override fun onStopTrackingTouch(sb: SeekBar?) { if (prepared) player.seekTo(sb?.progress ?: 0) }
         })
+
+        updateShuffleIcon(); updateRepeatIcon()
+    }
+
+    private fun updateShuffleIcon() {
+        binding.npShuffle.setColorFilter(if (shuffle) 0xFFF6C915.toInt() else 0xFF9797A8.toInt())
+    }
+
+    private fun updateRepeatIcon() {
+        binding.npRepeat.setImageResource(if (repeatMode == 2) R.drawable.ic_repeat_one else R.drawable.ic_repeat)
+        binding.npRepeat.setColorFilter(if (repeatMode != 0) 0xFFF6C915.toInt() else 0xFF9797A8.toInt())
     }
 
     private fun setupSearch() {
@@ -451,9 +447,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun playAt(list: List<Song>, index: Int) {
         if (index < 0 || index >= list.size) return
-        queue = list.toList()
-        queueIndex = index
-        history.clear()
+        queue = list.toList(); queueIndex = index; history.clear()
         loadAndPlay(queue[queueIndex])
     }
 
@@ -463,12 +457,33 @@ class MainActivity : AppCompatActivity() {
             player.reset()
             player.setDataSource(this, song.uri)
             player.prepareAsync()
-            binding.playerBar.visibility = android.view.View.VISIBLE
-            binding.npTitle.text = song.title
-            binding.npArtist.text =
-                if (song.artist.isBlank() || song.artist == "<unknown>") "Artista desconhecido" else song.artist
+            binding.miniBar.visibility = android.view.View.VISIBLE
+            updateNowPlayingUI(song)
             adapter.setPlaying(song.id)
         } catch (e: Exception) { e.printStackTrace() }
+    }
+
+    private fun updateNowPlayingUI(song: Song) {
+        val artistTxt = if (song.artist.isBlank() || song.artist == "<unknown>") "Artista desconhecido" else song.artist
+        binding.miniTitle.text = song.title
+        binding.miniArtist.text = artistTxt
+        binding.npBigTitle.text = song.title
+        binding.npBigArtist.text = artistTxt
+        val bmp = loadArtBitmap(song)
+        if (bmp != null) {
+            binding.miniArt.setImageBitmap(bmp); binding.npBigArt.setImageBitmap(bmp)
+        } else {
+            binding.miniArt.setImageResource(R.drawable.ic_note); binding.npBigArt.setImageResource(R.drawable.ic_note)
+        }
+    }
+
+    private fun loadArtBitmap(song: Song): Bitmap? {
+        val uri = ContentUris.withAppendedId(artBase, song.albumId)
+        return try {
+            contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                BitmapFactory.decodeFileDescriptor(pfd.fileDescriptor)
+            }
+        } catch (e: Exception) { null }
     }
 
     private fun nextTrack(auto: Boolean) {
@@ -501,34 +516,32 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updatePlayIcon() {
-        binding.btnPlaypause.setImageResource(
-            if (player.isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
-        )
+        val res = if (player.isPlaying) R.drawable.ic_pause else R.drawable.ic_play_arrow
+        binding.npPlaypause.setImageResource(res)
+        binding.miniPlaypause.setImageResource(res)
     }
 
     private val seekRunnable = object : Runnable {
         override fun run() {
             if (prepared && player.isPlaying) {
-                binding.seek.progress = player.currentPosition
-                binding.curTime.text = formatTime(player.currentPosition.toLong())
+                val pos = player.currentPosition
+                binding.npSeek.progress = pos
+                binding.miniProgress.progress = pos
+                binding.npCur.text = formatTime(pos.toLong())
             }
             handler.postDelayed(this, 500)
         }
     }
     private fun startSeekUpdater() { handler.removeCallbacks(seekRunnable); handler.post(seekRunnable) }
 
-    private fun formatTime(ms: Long): String {
-        val t = ms / 1000; return "%d:%02d".format(t / 60, t % 60)
-    }
+    private fun formatTime(ms: Long): String { val t = ms / 1000; return "%d:%02d".format(t / 60, t % 60) }
 
     private fun toast(msg: String) =
         android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()
 
     override fun onResume() {
         super.onResume()
-        if (ContextCompat.checkSelfPermission(this, permissionName()) == PackageManager.PERMISSION_GRANTED) {
-            loadSongs()
-        }
+        if (ContextCompat.checkSelfPermission(this, permissionName()) == PackageManager.PERMISSION_GRANTED) loadSongs()
     }
 
     override fun onDestroy() {

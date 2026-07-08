@@ -54,16 +54,21 @@ class RowAdapter(
     override fun getItemCount() = items.size
 
     override fun onBindViewHolder(holder: VH, position: Int) {
+        val pad = (holder.art.resources.displayMetrics.density * 12).toInt()
         when (val row = items[position]) {
             is Row.GroupRow -> {
                 holder.title.text = row.title
                 holder.title.setTextColor(0xFFF2F2F7.toInt())
                 holder.sub.text = row.subtitle
+                holder.art.scaleType = ImageView.ScaleType.CENTER_INSIDE
+                holder.art.setPadding(pad, pad, pad, pad)
                 holder.art.setImageResource(row.iconRes)
                 holder.art.setColorFilter(0xFFF6C915.toInt())
             }
             is Row.SongRow -> {
                 val song = row.song
+                holder.art.scaleType = ImageView.ScaleType.CENTER_CROP
+                holder.art.setPadding(0, 0, 0, 0)
                 holder.art.clearColorFilter()
                 holder.title.text = song.title
                 val dur = formatTime(song.duration)
